@@ -779,7 +779,11 @@ export function renderValue(
         ...processTemplate(renderStackItem.value, renderStackItem.renderInfo)
       );
     } else if (renderStackItem.type === 'add-to-render-result') {
-      renderResult.push(...renderStackItem.value);
+      renderResult.push(
+        ...(typeof renderStackItem.value === 'string'
+          ? [renderStackItem.value]
+          : renderStackItem.value)
+      );
     }
   }
 
