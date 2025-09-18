@@ -723,12 +723,75 @@ declare global {
   }
 }
 
+type RenderStackItem =
+  | {
+      type: 'value';
+      value: unknown;
+      renderInfo: RenderInfo;
+      hydratable: boolean;
+    }
+  | {
+      type: 'template';
+      value: TemplateResult;
+      renderInfo: RenderInfo;
+      hydratable: boolean;
+    }
+  | {
+      type: 'directive';
+      value: unknown;
+      renderInfo: RenderInfo;
+      hydratable: boolean;
+    }
+  | {
+      type: 'add-to-render-result';
+      value: RenderResult;
+      renderInfo: RenderInfo;
+      hydratable: boolean;
+    };
+
 export function renderValue(
   value: unknown,
   renderInfo: RenderInfo,
   hydratable = true
 ): RenderResult {
+  const renderStack: RenderStackItem[] = [
+    {
+      type: 'value',
+      value,
+      renderInfo,
+      hydratable,
+    },
+  ];
+
   const renderResult = [];
+  while (renderStack.length > 0) {
+    const renderStackItem = renderStack.shift()!;
+    if (renderStackItem.type === 'value') {
+      renderStack.unshift(
+        ...processValue(
+          renderStackItem.value,
+          renderStackItem.renderInfo,
+          renderStackItem.hydratable
+        )
+      );
+    } else if (renderStackItem.type === 'template') {
+      renderStack.unshift(
+        ...processTemplate(renderStackItem.value, renderStackItem.renderInfo)
+      );
+    } else if (renderStackItem.type === 'add-to-render-result') {
+      renderResult.push(...renderStackItem.value);
+    }
+  }
+
+  return renderResult;
+}
+
+function processValue(
+  value: unknown,
+  renderInfo: RenderInfo,
+  hydratable: boolean
+) {
+  const renderStack: RenderStackItem[] = [];
   if (renderInfo.customElementHostStack.length === 0) {
     // If the SSR root event target is not at the start of the event target
     // stack, we add it to the beginning of the array.
@@ -748,38 +811,44 @@ export function renderValue(
   }
 
   patchIfDirective(value);
-  if (isRenderLightDirective(value)) {
-    // If a value was produced with renderLight(), we want to call and render
-    // the renderLight() method.
-    const instance = getLast(renderInfo.customElementInstanceStack);
-    if (instance !== undefined) {
-      const renderLightResult = instance.renderLight(renderInfo);
-      if (renderLightResult !== undefined) {
-        renderResult.push(...renderLightResult);
-      }
-    }
-    value = null;
-  } else {
-    value = resolveDirective(
-      connectedDisconnectable({type: PartType.CHILD}) as ChildPart,
-      value
-    );
-  }
+  // renderLight directives are now handled earlier in processTemplate
+  value = resolveDirective(
+    connectedDisconnectable({type: PartType.CHILD}) as ChildPart,
+    value
+  );
+
   if (value != null && isTemplateResult(value)) {
     if (hydratable) {
-      renderResult.push(
-        `<!--lit-part ${digestForTemplateResult(value as TemplateResult)}-->`
-      );
+      renderStack.push({
+        type: 'add-to-render-result',
+        value: `<!--lit-part ${digestForTemplateResult(value as TemplateResult)}-->`,
+        renderInfo,
+        hydratable,
+      });
     }
-    renderResult.push(
-      ...renderTemplateResult(value as TemplateResult, renderInfo)
-    );
+    renderStack.push({
+      type: 'template',
+      value: value as TemplateResult,
+      renderInfo,
+      hydratable,
+    });
+
     if (hydratable) {
-      renderResult.push(`<!--/lit-part-->`);
+      renderStack.push({
+        type: 'add-to-render-result',
+        value: `<!--/lit-part-->`,
+        renderInfo,
+        hydratable,
+      });
     }
   } else {
     if (hydratable) {
-      renderResult.push(`<!--lit-part-->`);
+      renderStack.push({
+        type: 'add-to-render-result',
+        value: `<!--lit-part-->`,
+        renderInfo,
+        hydratable,
+      });
     }
     if (
       value === undefined ||
@@ -791,22 +860,34 @@ export function renderValue(
     } else if (!isPrimitive(value) && isIterable(value)) {
       // Check that value is not a primitive, since strings are iterable
       for (const item of value) {
-        renderResult.push(...renderValue(item, renderInfo, hydratable));
+        renderStack.push({
+          type: 'value',
+          value: item,
+          renderInfo,
+          hydratable,
+        });
       }
     } else {
-      renderResult.push(escapeHtml(String(value)));
+      renderStack.push({
+        type: 'add-to-render-result',
+        value: escapeHtml(String(value)),
+        renderInfo,
+        hydratable,
+      });
     }
     if (hydratable) {
-      renderResult.push(`<!--/lit-part-->`);
+      renderStack.push({
+        type: 'add-to-render-result',
+        value: `<!--/lit-part-->`,
+        renderInfo,
+        hydratable,
+      });
     }
   }
-  return renderResult;
+  return renderStack;
 }
 
-function renderTemplateResult(
-  result: TemplateResult,
-  renderInfo: RenderInfo
-): RenderResult {
+function processTemplate(result: TemplateResult, renderInfo: RenderInfo) {
   // In order to render a TemplateResult we have to handle and stream out
   // different parts of the result separately:
   //   - Literal sections of the template
@@ -824,15 +905,19 @@ function renderTemplateResult(
 
   const hydratable = isHydratable(result);
   const ops = getTemplateOpcodes(result);
-
+  const renderStack: RenderStackItem[] = [];
   /* The next value in result.values to render */
   let partIndex = 0;
 
-  const renderResult = [];
   for (const op of ops) {
     switch (op.type) {
       case 'text':
-        renderResult.push(op.value);
+        renderStack.push({
+          type: 'add-to-render-result',
+          value: op.value,
+          renderInfo,
+          hydratable,
+        });
         break;
       case 'child-part': {
         const value = result.values[partIndex++];
@@ -850,7 +935,30 @@ And the inner template was:
             );
           }
         }
-        renderResult.push(...renderValue(value, renderInfo, isValueHydratable));
+
+        // Handle renderLight directive immediately while element is still on stack
+        patchIfDirective(value);
+        if (isRenderLightDirective(value)) {
+          const instance = getLast(renderInfo.customElementInstanceStack);
+          if (instance !== undefined) {
+            const renderLightResult = instance.renderLight(renderInfo);
+            if (renderLightResult !== undefined) {
+              renderStack.push({
+                type: 'add-to-render-result',
+                value: renderLightResult,
+                renderInfo,
+                hydratable,
+              });
+            }
+          }
+        } else {
+          renderStack.push({
+            type: 'value',
+            value,
+            renderInfo,
+            hydratable: isValueHydratable,
+          });
+        }
         break;
       }
       case 'attribute-part': {
@@ -884,16 +992,27 @@ And the inner template was:
             ? getLast(renderInfo.customElementInstanceStack)
             : undefined;
           if (part.type === PartType.PROPERTY) {
-            renderResult.push(renderPropertyPart(instance, op, committedValue));
+            renderStack.push({
+              type: 'add-to-render-result',
+              value: renderPropertyPart(instance, op, committedValue),
+              renderInfo,
+              hydratable,
+            });
           } else if (part.type === PartType.BOOLEAN_ATTRIBUTE) {
             // Boolean attribute binding
-            renderResult.push(
-              ...renderBooleanAttributePart(instance, op, committedValue)
-            );
+            renderStack.push({
+              type: 'add-to-render-result',
+              value: renderBooleanAttributePart(instance, op, committedValue),
+              renderInfo,
+              hydratable,
+            });
           } else {
-            renderResult.push(
-              ...renderAttributePart(instance, op, committedValue)
-            );
+            renderStack.push({
+              type: 'add-to-render-result',
+              value: renderAttributePart(instance, op, committedValue),
+              renderInfo,
+              hydratable,
+            });
           }
         }
         partIndex += statics.length - 1;
@@ -914,6 +1033,7 @@ And the inner template was:
           op.ctor,
           op.staticAttributes
         );
+
         if (instance.element) {
           // In the case the renderer has created an instance, we want to set
           // the event target parent and the host of the element. Our
@@ -955,7 +1075,12 @@ And the inner template was:
         }
         // Render out any attributes on the instance (both static and those
         // that may have been dynamically set by the renderer)
-        renderResult.push(...instance.renderAttributes());
+        renderStack.push({
+          type: 'add-to-render-result',
+          value: instance.renderAttributes(),
+          renderInfo,
+          hydratable,
+        });
         // If deferHydration flag is true or if this element is nested in
         // another, add the `defer-hydration` attribute, so that it does not
         // enable before the host element hydrates
@@ -963,7 +1088,12 @@ And the inner template was:
           renderInfo.deferHydration ||
           renderInfo.customElementHostStack.length > 0
         ) {
-          renderResult.push(' defer-hydration');
+          renderStack.push({
+            type: 'add-to-render-result',
+            value: ' defer-hydration',
+            renderInfo,
+            hydratable,
+          });
         }
         break;
       }
@@ -977,7 +1107,12 @@ And the inner template was:
           renderInfo.customElementHostStack.length > 0
         ) {
           if (hydratable) {
-            renderResult.push(`<!--lit-node ${op.nodeIndex}-->`);
+            renderStack.push({
+              type: 'add-to-render-result',
+              value: `<!--lit-node ${op.nodeIndex}-->`,
+              renderInfo,
+              hydratable,
+            });
           }
         }
         break;
@@ -1001,11 +1136,24 @@ And the inner template was:
           const delegatesfocusAttr = delegatesFocus
             ? ' shadowrootdelegatesfocus'
             : '';
-          renderResult.push(
-            `<template shadowroot="${mode}" shadowrootmode="${mode}"${delegatesfocusAttr}>`
-          );
-          renderResult.push(...shadowContents);
-          renderResult.push('</template>');
+          renderStack.push({
+            type: 'add-to-render-result',
+            value: `<template shadowroot="${mode}" shadowrootmode="${mode}"${delegatesfocusAttr}>`,
+            renderInfo,
+            hydratable,
+          });
+          renderStack.push({
+            type: 'add-to-render-result',
+            value: shadowContents,
+            renderInfo,
+            hydratable,
+          });
+          renderStack.push({
+            type: 'add-to-render-result',
+            value: '</template>',
+            renderInfo,
+            hydratable,
+          });
         }
         renderInfo.customElementHostStack.pop();
         break;
@@ -1068,7 +1216,7 @@ And the inner template was:
   if (partIndex !== result.values.length) {
     throwErrorForPartIndexMismatch(partIndex, result);
   }
-  return renderResult;
+  return renderStack;
 }
 
 function throwErrorForPartIndexMismatch(
